@@ -1,0 +1,9 @@
+# Ignore all files inside the pdfs folder
+pdfs/*
+# But don't ignore the folder itself (keep it in the repo)
+!pdfs/.gitkeep
+
+# Ignore all files inside the output folder
+output/*
+# But don't ignore the folder itself
+!output/.gitkeep
