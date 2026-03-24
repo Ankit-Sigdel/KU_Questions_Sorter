@@ -593,7 +593,8 @@ def build_pdf(course_code: str,
               course_name: str,
               question_groups: List[List[Question]],
               all_papers: List[SubPaper],
-              output_path: str):
+              output_path: str,
+              show_frequency: bool = True):
 
     # ── per-page footer via canvas callback ────────────────────────────────
     FOOTER_TEXT = "Question Sorter  |  Made by: Ankit Sigdel"
@@ -677,9 +678,6 @@ def build_pdf(course_code: str,
 
     course_papers = [p for p in all_papers if p.course_code == course_code]
     total_q   = sum(len(g) for g in question_groups)
-    unique_q  = len(question_groups)
-    repeated  = sum(1 for g in question_groups if len(g) > 1)
-    max_freq  = max((len(g) for g in question_groups), default=1)
     dates     = sorted(set(p.exam_date for p in course_papers if p.exam_date
                             and len(p.exam_date) < 60))          # skip garbage dates
 
@@ -691,15 +689,26 @@ def build_pdf(course_code: str,
     else:
         dates_cell = "—"
 
-    stats = [
-        ["Statistic",                      "Value"],
-        ["Total questions (all sittings)",  str(total_q)],
-        ["Unique question topics",          str(unique_q)],
-        ["Topics repeated 2+ times",        str(repeated)],
-        ["Highest repeat count",            str(max_freq)],
-        ["Exam sittings analysed",          str(len(course_papers))],
-        ["Exam dates",                      dates_cell],
-    ]
+    if show_frequency:
+        unique_q = len(question_groups)
+        repeated = sum(1 for g in question_groups if len(g) > 1)
+        max_freq = max((len(g) for g in question_groups), default=1)
+        stats = [
+            ["Statistic",                      "Value"],
+            ["Total questions (all sittings)",  str(total_q)],
+            ["Unique question topics",          str(unique_q)],
+            ["Topics repeated 2+ times",        str(repeated)],
+            ["Highest repeat count",            str(max_freq)],
+            ["Exam sittings analysed",          str(len(course_papers))],
+            ["Exam dates",                      dates_cell],
+        ]
+    else:
+        stats = [
+            ["Statistic",                      "Value"],
+            ["Total questions (all sittings)",  str(total_q)],
+            ["Exam sittings analysed",          str(len(course_papers))],
+            ["Exam dates",                      dates_cell],
+        ]
     st = Table(stats, colWidths=[9.5*cm, 6.5*cm])
     st.setStyle(TableStyle([
         ('BACKGROUND',    (0,0),(-1,0), C_INDIGO),
@@ -717,17 +726,24 @@ def build_pdf(course_code: str,
 
     story.append(HRFlowable(width="100%", thickness=0.5, color=C_GREY1))
     story.append(Spacer(1,0.3*cm))
-    story.append(Paragraph(
-        "Colour of the frequency badge: "
-        "<font color='#880e4f'><b> ■ 5+ </b></font>  "
-        "<font color='#b71c1c'><b> ■ 4 </b></font>  "
-        "<font color='#e53935'><b> ■ 3 </b></font>  "
-        "<font color='#e65100'><b> ■ 2 </b></font>  "
-        "<font color='#757575'><b> ■ 1 </b></font>  "
-        "  |  Sorted: most repeated → least repeated.  "
-        "Every question is included.",
-        S_LEGEND
-    ))
+    if show_frequency:
+        story.append(Paragraph(
+            "Colour of the frequency badge: "
+            "<font color='#880e4f'><b> ■ 5+ </b></font>  "
+            "<font color='#b71c1c'><b> ■ 4 </b></font>  "
+            "<font color='#e53935'><b> ■ 3 </b></font>  "
+            "<font color='#e65100'><b> ■ 2 </b></font>  "
+            "<font color='#757575'><b> ■ 1 </b></font>  "
+            "  |  Sorted: most repeated → least repeated.  "
+            "Every question is included.",
+            S_LEGEND
+        ))
+    else:
+        story.append(Paragraph(
+            "Questions sorted by section (A → B → C …) then by exam date.  "
+            "Each question is listed once per exam paper it appeared in.",
+            S_LEGEND
+        ))
     story.append(PageBreak())
 
     # ─── Question pages ───────────────────────────────────────────────────────
@@ -747,49 +763,57 @@ def build_pdf(course_code: str,
             fc     = _freq_color(freq)
             text   = _clean(rep.text)
 
-            # header row: Q number left, frequency badge right
-            hrow = Table(
-                [[Paragraph(f"<b>Q{idx}.</b>", S_QNUM),
-                  Paragraph(
-                      f'<font color="white"><b>  ×{freq}  </b></font>',
-                      ps('B', fontSize=9, fontName='Helvetica-Bold', alignment=TA_RIGHT)
-                  )]],
-                colWidths=[12.5*cm, 3.5*cm]
-            )
-            hrow.setStyle(TableStyle([
-                ('BACKGROUND',    (1,0),(1,0), fc),
-                ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
-                ('LEFTPADDING',   (0,0),(-1,-1), 2),
-                ('RIGHTPADDING',  (0,0),(-1,-1), 4),
-                ('TOPPADDING',    (0,0),(-1,-1), 1),
-                ('BOTTOMPADDING', (0,0),(-1,-1), 1),
-            ]))
-
-            # "Appeared in" line – deduplicate and stack neatly
-            seen_dates = []
-            for q in grp:
-                d = (q.exam_date or q.source_file)
-                if d and len(d) < 60 and d not in seen_dates:
-                    seen_dates.append(d)
-            if seen_dates:
-                if len(seen_dates) <= 4:
-                    # short list: inline with bullets
-                    src_inner = "  ·  ".join(_xml(d) for d in seen_dates)
-                else:
-                    # long list: two columns using a mini-table
-                    mid = (len(seen_dates) + 1) // 2
-                    left_col  = "<br/>".join(_xml(d) for d in seen_dates[:mid])
-                    right_col = "<br/>".join(_xml(d) for d in seen_dates[mid:])
-                    src_inner = f"{left_col}&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{right_col}"
-                src_txt = f"Appeared in ({len(seen_dates)}x):  {src_inner}"
+            if show_frequency:
+                # header row: Q number left, frequency badge right
+                hrow = Table(
+                    [[Paragraph(f"<b>Q{idx}.</b>", S_QNUM),
+                      Paragraph(
+                          f'<font color="white"><b>  ×{freq}  </b></font>',
+                          ps('B', fontSize=9, fontName='Helvetica-Bold', alignment=TA_RIGHT)
+                      )]],
+                    colWidths=[12.5*cm, 3.5*cm]
+                )
+                hrow.setStyle(TableStyle([
+                    ('BACKGROUND',    (1,0),(1,0), fc),
+                    ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+                    ('LEFTPADDING',   (0,0),(-1,-1), 2),
+                    ('RIGHTPADDING',  (0,0),(-1,-1), 4),
+                    ('TOPPADDING',    (0,0),(-1,-1), 1),
+                    ('BOTTOMPADDING', (0,0),(-1,-1), 1),
+                ]))
             else:
-                src_txt = "Source: " + _xml(grp[0].source_file)
+                # plain question number, no badge
+                hrow = Paragraph(f"<b>Q{idx}.</b>", S_QNUM)
+
+            # source line
+            if show_frequency:
+                # "Appeared in" line – deduplicate and stack neatly
+                seen_dates = []
+                for q in grp:
+                    d = (q.exam_date or q.source_file)
+                    if d and len(d) < 60 and d not in seen_dates:
+                        seen_dates.append(d)
+                if seen_dates:
+                    if len(seen_dates) <= 4:
+                        src_inner = "  ·  ".join(_xml(d) for d in seen_dates)
+                    else:
+                        mid = (len(seen_dates) + 1) // 2
+                        left_col  = "<br/>".join(_xml(d) for d in seen_dates[:mid])
+                        right_col = "<br/>".join(_xml(d) for d in seen_dates[mid:])
+                        src_inner = f"{left_col}&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{right_col}"
+                    src_txt = f"Appeared in ({len(seen_dates)}x):  {src_inner}"
+                else:
+                    src_txt = "Source: " + _xml(grp[0].source_file)
+            else:
+                d = rep.exam_date or rep.source_file
+                src_txt = f"Source: {_xml(d)}" if d else ""
 
             block = [hrow, Paragraph(_xml(text), S_QTEXT)]
             if rep.marks > 0:
                 block.append(Paragraph(f"[{rep.marks} marks]", S_MARKS))
-            block.append(Paragraph(f"<i>{src_txt}</i>", S_SRC))
-            if freq > 1:
+            if src_txt:
+                block.append(Paragraph(f"<i>{src_txt}</i>", S_SRC))
+            if show_frequency and freq > 1:
                 bw = min(2 + freq*1.5, 16) * cm
                 block.append(HRFlowable(width=bw, thickness=2.5,
                                         color=fc, lineCap='round', spaceAfter=2))
@@ -936,20 +960,21 @@ def run(input_dir: str, output_dir: str,
         print(f"{'='*64}")
         print(f"  Questions collected  : {len(all_qs)}")
 
-        print(f"  Grouping (NLP) …", end="", flush=True)
-        groups = group_questions(all_qs)
-        rpt = [g for g in groups if len(g) > 1]
-        print(f"  done.")
-        print(f"  Unique topics        : {len(groups)}")
-        print(f"  Repeated ≥2 times    : {len(rpt)}")
-        if groups:
-            top = groups[0]
-            print(f"  Most repeated (×{len(top):2})   : {top[0].text[:70]}…")
+        # Sort all questions by section, then exam date, then question number.
+        # Each question is its own group so duplicates are preserved as-is.
+        def _sort_key(q: Question):
+            m = re.match(r'(\d+)', q.number)
+            num = int(m.group(1)) if m else 0
+            return (q.section, q.exam_date or "", num)
+
+        sorted_qs = sorted(all_qs, key=_sort_key)
+        groups = [[q] for q in sorted_qs]
+        print(f"  Questions (by section): {len(groups)}")
 
         safe = re.sub(r'[^\w\-]', '_', code)
         outf = os.path.join(output_dir, f"QuestionBank_{safe}.pdf")
         print(f"  Building PDF …")
-        build_pdf(code, name, groups, all_papers, outf)
+        build_pdf(code, name, groups, all_papers, outf, show_frequency=False)
 
     print(f"\n{'='*64}")
     print(f"  Done!  Output folder: {output_dir}")
