@@ -16,26 +16,21 @@ Usage:
     python question_sorter.py /path/to/pdfs --all    # generate all courses
 """
 
-import os, sys, re, math, subprocess
+import os, sys, re, math, subprocess, tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Set
 
-# ── optional deps ──────────────────────────────────────────────────────────────
+# ── required deps ──────────────────────────────────────────────────────────────
 try:
     import pdfplumber
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.lib import colors
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        HRFlowable, PageBreak, KeepTogether, BaseDocTemplate, Frame, PageTemplate
-    )
-    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-    from reportlab.pdfgen import canvas as rl_canvas
-except ImportError as e:
-    sys.exit(f"Missing: {e}\nRun: pip install pdfplumber reportlab")
+except ImportError:
+    sys.exit("Missing: pdfplumber\nRun: pip install pdfplumber")
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    sys.exit("Missing: PyMuPDF\nRun: pip install PyMuPDF")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COURSE CATALOGUE  –  canonical code → human name
@@ -181,6 +176,9 @@ class SubPaper:
     course_name: str
     exam_date:   str
     source_file: str
+    source_path: str      # full path to the source PDF
+    start_page:  int      # 1-indexed first page of this sub-paper
+    end_page:    int      # 1-indexed last page of this sub-paper
     level:       str
     full_marks:  str
     questions:   List[Question] = field(default_factory=list)
@@ -392,6 +390,9 @@ def process_pdf(pdf_path: str) -> List[SubPaper]:
             course_name=CATALOGUE.get(canonical, ""),
             exam_date=hdr["exam_date"] or fname,
             source_file=fname,
+            source_path=pdf_path,
+            start_page=start,
+            end_page=end,
             level=hdr["level"],
             full_marks=hdr["full_marks"],
             questions=qs,
@@ -555,275 +556,75 @@ def group_questions(questions: List[Question],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PDF GENERATION  – one output file per canonical course
+#  PDF GENERATION  – render original pages as images, combine into one PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
-# colours
-C_DEEP_PURPLE = colors.HexColor('#4a148c')
-C_PURPLE      = colors.HexColor('#7b1fa2')
-C_INDIGO      = colors.HexColor('#1a237e')
-C_INDIGO_PALE = colors.HexColor('#e8eaf6')
-C_RED5        = colors.HexColor('#880e4f')
-C_RED4        = colors.HexColor('#b71c1c')
-C_RED3        = colors.HexColor('#e53935')
-C_ORANGE2     = colors.HexColor('#e65100')
-C_GREY1       = colors.HexColor('#757575')
-C_GREY_PALE   = colors.HexColor('#f5f5f5')
+def render_course_to_pdf(course_code: str,
+                         papers: List[SubPaper],
+                         output_path: str,
+                         dpi: int = 150) -> None:
+    """
+    For every SubPaper in *papers*, render the source PDF pages (start_page …
+    end_page) as PNG images at *dpi* resolution, combine all images into a
+    single output PDF, then delete the temporary images.
+    """
+    tmp_dir     = tempfile.mkdtemp(prefix="ku_qs_")
+    image_paths: List[str] = []
 
+    try:
+        for paper in papers:
+            try:
+                src = fitz.open(paper.source_path)
+            except Exception as e:
+                print(f"    ⚠  Cannot open {paper.source_path}: {e}")
+                continue
 
-def _xml(text: str) -> str:
-    t = str(text)
-    t = t.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
-    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', t)
+            zoom = dpi / 72.0
+            mat  = fitz.Matrix(zoom, zoom)
 
-def _clean(text: str) -> str:
-    text = re.sub(r'\bP\.T\.O\.?\b', '', text, flags=re.I)
-    text = re.sub(r'\s{2,}', ' ', text).strip()
-    return text[:900] + "…" if len(text) > 900 else text
-
-def _freq_color(freq: int) -> colors.Color:
-    if freq >= 5: return C_RED5
-    if freq >= 4: return C_RED4
-    if freq >= 3: return C_RED3
-    if freq >= 2: return C_ORANGE2
-    return C_GREY1
-
-
-def build_pdf(course_code: str,
-              course_name: str,
-              question_groups: List[List[Question]],
-              all_papers: List[SubPaper],
-              output_path: str,
-              show_frequency: bool = True):
-
-    # ── per-page footer via canvas callback ────────────────────────────────
-    FOOTER_TEXT = "Question Sorter  |  Made by: Ankit Sigdel"
-
-    def _draw_page_footer(canv, doc):
-        canv.saveState()
-        page_w, page_h = A4
-        footer_y = 1.1 * cm
-        # separator line
-        canv.setStrokeColor(colors.HexColor("#9fa8da"))
-        canv.setLineWidth(0.5)
-        canv.line(2.2*cm, footer_y + 0.35*cm, page_w - 2.2*cm, footer_y + 0.35*cm)
-        # left: branding
-        canv.setFont("Helvetica", 7)
-        canv.setFillColor(colors.HexColor("#757575"))
-        canv.drawString(2.2*cm, footer_y, FOOTER_TEXT)
-        # right: page number
-        canv.drawRightString(page_w - 2.2*cm, footer_y,
-                             f"Page {doc.page}")
-        # centre: course
-        canv.drawCentredString(page_w / 2, footer_y,
-                               f"{course_code}  –  {course_name}")
-        canv.restoreState()
-
-    class _KUDoc(BaseDocTemplate):
-        def __init__(self, *a, **kw):
-            BaseDocTemplate.__init__(self, *a, **kw)
-            frame = Frame(
-                self.leftMargin, self.bottomMargin,
-                self.width, self.height, id="normal"
-            )
-            self.addPageTemplates([
-                PageTemplate(id="All", frames=frame,
-                             onPage=_draw_page_footer)
-            ])
-
-    doc = _KUDoc(
-        output_path, pagesize=A4,
-        leftMargin=2.2*cm, rightMargin=2.2*cm,
-        topMargin=2.5*cm,  bottomMargin=2.5*cm,
-        title=f"KU Question Bank – {course_code}",
-        author="KU Question Sorter v2  |  Made by: Ankit Sigdel",
-    )
-
-    ST = getSampleStyleSheet()
-    def ps(name, **kw):
-        return ParagraphStyle(name, parent=ST['Normal'], **kw)
-
-    S_TITLE    = ps('T',  fontSize=20, fontName='Helvetica-Bold',
-                    textColor=C_INDIGO, alignment=TA_CENTER, spaceAfter=4)
-    S_SUB      = ps('S',  fontSize=11, textColor=C_GREY1,
-                    alignment=TA_CENTER, spaceAfter=4)
-    S_SEC      = ps('SH', fontSize=12, fontName='Helvetica-Bold',
-                    textColor=colors.white, backColor=C_INDIGO,
-                    spaceBefore=14, spaceAfter=4,
-                    leftIndent=-0.3*cm, rightIndent=-0.3*cm, borderPad=5)
-    S_QNUM     = ps('QN', fontSize=10, fontName='Helvetica-Bold',
-                    textColor=C_INDIGO, spaceBefore=5, spaceAfter=1)
-    S_QTEXT    = ps('QT', fontSize=10, leading=14, leftIndent=0.6*cm, spaceAfter=3)
-    S_MARKS    = ps('QM', fontSize=8,  textColor=C_GREY1,
-                    leftIndent=0.6*cm, spaceAfter=2)
-    S_SRC      = ps('SR', fontSize=8,  textColor=C_GREY1, fontName='Helvetica-Oblique',
-                    leftIndent=0.6*cm, spaceAfter=5)
-    S_FOOT     = ps('FT', fontSize=7.5, textColor=C_GREY1, alignment=TA_CENTER)
-    S_LEGEND   = ps('LG', fontSize=8.5, textColor=colors.HexColor('#37474f'),
-                    backColor=colors.HexColor('#fff9c4'), borderPad=5, spaceAfter=8)
-
-    story = []
-
-    # ─── Cover page ──────────────────────────────────────────────────────────
-    story += [
-        Spacer(1, 0.8*cm),
-        Paragraph("KATHMANDU UNIVERSITY", S_TITLE),
-        Paragraph("Sorted Question Bank", S_SUB),
-        Spacer(1, 0.3*cm),
-        HRFlowable(width="100%", thickness=2, color=C_INDIGO, spaceAfter=10),
-    ]
-
-    story.append(Paragraph(
-        f"<b>Course:</b>  {_xml(course_code)}  –  {_xml(course_name)}", ST['Normal']))
-
-    course_papers = [p for p in all_papers if p.course_code == course_code]
-    total_q   = sum(len(g) for g in question_groups)
-    dates     = sorted(set(p.exam_date for p in course_papers if p.exam_date
-                            and len(p.exam_date) < 60))          # skip garbage dates
-
-    # Format dates: one per line so they never overflow the table cell
-    if dates:
-        dates_cell = Paragraph("<br/>".join(_xml(d) for d in dates),
-                               ParagraphStyle("DC", parent=ST["Normal"],
-                                              fontSize=8, leading=11))
-    else:
-        dates_cell = "—"
-
-    if show_frequency:
-        unique_q = len(question_groups)
-        repeated = sum(1 for g in question_groups if len(g) > 1)
-        max_freq = max((len(g) for g in question_groups), default=1)
-        stats = [
-            ["Statistic",                      "Value"],
-            ["Total questions (all sittings)",  str(total_q)],
-            ["Unique question topics",          str(unique_q)],
-            ["Topics repeated 2+ times",        str(repeated)],
-            ["Highest repeat count",            str(max_freq)],
-            ["Exam sittings analysed",          str(len(course_papers))],
-            ["Exam dates",                      dates_cell],
-        ]
-    else:
-        stats = [
-            ["Statistic",                      "Value"],
-            ["Total questions (all sittings)",  str(total_q)],
-            ["Exam sittings analysed",          str(len(course_papers))],
-            ["Exam dates",                      dates_cell],
-        ]
-    st = Table(stats, colWidths=[9.5*cm, 6.5*cm])
-    st.setStyle(TableStyle([
-        ('BACKGROUND',    (0,0),(-1,0), C_INDIGO),
-        ('TEXTCOLOR',     (0,0),(-1,0), colors.white),
-        ('FONTNAME',      (0,0),(-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE',      (0,0),(-1,-1), 8.5),
-        ('ROWBACKGROUNDS',(0,1),(-1,-1), [C_INDIGO_PALE, colors.white]),
-        ('GRID',          (0,0),(-1,-1), 0.4, colors.HexColor('#9fa8da')),
-        ('LEFTPADDING',   (0,0),(-1,-1), 5),
-        ('RIGHTPADDING',  (0,0),(-1,-1), 5),
-        ('TOPPADDING',    (0,0),(-1,-1), 3),
-        ('BOTTOMPADDING', (0,0),(-1,-1), 3),
-    ]))
-    story += [Spacer(1,0.4*cm), st, Spacer(1,0.4*cm)]
-
-    story.append(HRFlowable(width="100%", thickness=0.5, color=C_GREY1))
-    story.append(Spacer(1,0.3*cm))
-    if show_frequency:
-        story.append(Paragraph(
-            "Colour of the frequency badge: "
-            "<font color='#880e4f'><b> ■ 5+ </b></font>  "
-            "<font color='#b71c1c'><b> ■ 4 </b></font>  "
-            "<font color='#e53935'><b> ■ 3 </b></font>  "
-            "<font color='#e65100'><b> ■ 2 </b></font>  "
-            "<font color='#757575'><b> ■ 1 </b></font>  "
-            "  |  Sorted: most repeated → least repeated.  "
-            "Every question is included.",
-            S_LEGEND
-        ))
-    else:
-        story.append(Paragraph(
-            "Questions sorted by section (A → B → C …) then by exam date.  "
-            "Each question is listed once per exam paper it appeared in.",
-            S_LEGEND
-        ))
-    story.append(PageBreak())
-
-    # ─── Question pages ───────────────────────────────────────────────────────
-    # Group by dominant section label
-    by_sec: Dict[str, List[List[Question]]] = defaultdict(list)
-    for grp in question_groups:
-        secs = [q.section for q in grp]
-        by_sec[max(set(secs), key=secs.count)].append(grp)
-
-    for sec in sorted(by_sec.keys()):
-        story.append(Paragraph(f"  SECTION {sec}", S_SEC))
-        story.append(Spacer(1, 0.15*cm))
-
-        for idx, grp in enumerate(by_sec[sec], 1):
-            freq   = len(grp)
-            rep    = grp[0]
-            fc     = _freq_color(freq)
-            text   = _clean(rep.text)
-
-            if show_frequency:
-                # header row: Q number left, frequency badge right
-                hrow = Table(
-                    [[Paragraph(f"<b>Q{idx}.</b>", S_QNUM),
-                      Paragraph(
-                          f'<font color="white"><b>  ×{freq}  </b></font>',
-                          ps('B', fontSize=9, fontName='Helvetica-Bold', alignment=TA_RIGHT)
-                      )]],
-                    colWidths=[12.5*cm, 3.5*cm]
+            # fitz pages are 0-indexed; SubPaper pages are 1-indexed
+            for pg in range(paper.start_page - 1, paper.end_page):
+                if pg < 0 or pg >= len(src):
+                    continue
+                pix      = src[pg].get_pixmap(matrix=mat, alpha=False)
+                img_name = (
+                    f"{re.sub(r'[^\\w]', '_', course_code)}_"
+                    f"{re.sub(r'[^\\w]', '_', os.path.basename(paper.source_path))}_"
+                    f"{pg:04d}.png"
                 )
-                hrow.setStyle(TableStyle([
-                    ('BACKGROUND',    (1,0),(1,0), fc),
-                    ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
-                    ('LEFTPADDING',   (0,0),(-1,-1), 2),
-                    ('RIGHTPADDING',  (0,0),(-1,-1), 4),
-                    ('TOPPADDING',    (0,0),(-1,-1), 1),
-                    ('BOTTOMPADDING', (0,0),(-1,-1), 1),
-                ]))
-            else:
-                # plain question number, no badge
-                hrow = Paragraph(f"<b>Q{idx}.</b>", S_QNUM)
+                img_path = os.path.join(tmp_dir, img_name)
+                pix.save(img_path)
+                image_paths.append(img_path)
 
-            # source line
-            if show_frequency:
-                # "Appeared in" line – deduplicate and stack neatly
-                seen_dates = []
-                for q in grp:
-                    d = (q.exam_date or q.source_file)
-                    if d and len(d) < 60 and d not in seen_dates:
-                        seen_dates.append(d)
-                if seen_dates:
-                    if len(seen_dates) <= 4:
-                        src_inner = "  ·  ".join(_xml(d) for d in seen_dates)
-                    else:
-                        mid = (len(seen_dates) + 1) // 2
-                        left_col  = "<br/>".join(_xml(d) for d in seen_dates[:mid])
-                        right_col = "<br/>".join(_xml(d) for d in seen_dates[mid:])
-                        src_inner = f"{left_col}&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{right_col}"
-                    src_txt = f"Appeared in ({len(seen_dates)}x):  {src_inner}"
-                else:
-                    src_txt = "Source: " + _xml(grp[0].source_file)
-            else:
-                d = rep.exam_date or rep.source_file
-                src_txt = f"Source: {_xml(d)}" if d else ""
+            src.close()
 
-            block = [hrow, Paragraph(_xml(text), S_QTEXT)]
-            if rep.marks > 0:
-                block.append(Paragraph(f"[{rep.marks} marks]", S_MARKS))
-            if src_txt:
-                block.append(Paragraph(f"<i>{src_txt}</i>", S_SRC))
-            if show_frequency and freq > 1:
-                bw = min(2 + freq*1.5, 16) * cm
-                block.append(HRFlowable(width=bw, thickness=2.5,
-                                        color=fc, lineCap='round', spaceAfter=2))
-            block.append(Spacer(1, 0.1*cm))
-            story.append(KeepTogether(block))
+        if not image_paths:
+            print(f"  ⚠  No pages to render for {course_code}")
+            return
 
-    # end-of-document spacer only (footer drawn per-page via canvas callback)
-    story.append(Spacer(1, 1.5*cm))
-    doc.build(story)
-    print(f"    Saved → {output_path}")
+        # Combine all page images into a single output PDF
+        out_doc = fitz.open()
+        for img_path in image_paths:
+            with fitz.open(img_path) as img_doc:
+                rect = img_doc[0].rect
+            page = out_doc.new_page(width=rect.width, height=rect.height)
+            page.insert_image(page.rect, filename=img_path)
+
+        out_doc.save(output_path, deflate=True)
+        out_doc.close()
+        print(f"    Saved → {output_path}")
+
+    finally:
+        # Always delete temporary screenshots
+        for img_path in image_paths:
+            try:
+                os.remove(img_path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -950,31 +751,17 @@ def run(input_dir: str, output_dir: str,
     for code in selected:
         papers   = course_index.get(code, [])
         if not papers: continue
-        all_qs   = [q for p in papers for q in p.questions]
-        if not all_qs:
-            print(f"\n  ⚠  No questions for {code}"); continue
 
         name = CATALOGUE.get(code, papers[0].course_name or code)
         print(f"\n{'='*64}")
         print(f"  GENERATING:  {code}  –  {name}")
         print(f"{'='*64}")
-        print(f"  Questions collected  : {len(all_qs)}")
-
-        # Sort all questions by section, then exam date, then question number.
-        # Each question is its own group so duplicates are preserved as-is.
-        def _sort_key(q: Question):
-            m = re.match(r'(\d+)', q.number)
-            num = int(m.group(1)) if m else 0
-            return (q.section, q.exam_date or "", num)
-
-        sorted_qs = sorted(all_qs, key=_sort_key)
-        groups = [[q] for q in sorted_qs]
-        print(f"  Questions (by section): {len(groups)}")
+        print(f"  Source papers : {len(papers)}")
 
         safe = re.sub(r'[^\w\-]', '_', code)
         outf = os.path.join(output_dir, f"QuestionBank_{safe}.pdf")
-        print(f"  Building PDF …")
-        build_pdf(code, name, groups, all_papers, outf, show_frequency=False)
+        print(f"  Rendering pages to PDF …")
+        render_course_to_pdf(code, papers, outf)
 
     print(f"\n{'='*64}")
     print(f"  Done!  Output folder: {output_dir}")
