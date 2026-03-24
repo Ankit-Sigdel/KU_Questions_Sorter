@@ -960,12 +960,13 @@ def run(input_dir: str, output_dir: str,
         print(f"{'='*64}")
         print(f"  Questions collected  : {len(all_qs)}")
 
-        # Sort all questions by section, then exam date, then question number.
-        # Each question is its own group so duplicates are preserved as-is.
+        # Sort all questions by section, then exam date (or source file), then
+        # question number. Each question is its own group so duplicates are
+        # preserved as-is.
         def _sort_key(q: Question):
             m = re.match(r'(\d+)', q.number)
             num = int(m.group(1)) if m else 0
-            return (q.section, q.exam_date or "", num)
+            return (q.section, q.exam_date or getattr(q, "source_file", "") or "", num)
 
         sorted_qs = sorted(all_qs, key=_sort_key)
         groups = [[q] for q in sorted_qs]
