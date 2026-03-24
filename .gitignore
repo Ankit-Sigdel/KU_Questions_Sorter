@@ -7,3 +7,7 @@ pdfs/*
 output/*
 # But don't ignore the folder itself
 !output/.gitkeep
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
